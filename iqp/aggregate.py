@@ -61,7 +61,7 @@ def collect_tidy(cfg) -> pd.DataFrame:
                                      d[key], unc, d.get("n")))
         if v.is_base:
             for code in cfg.langs:
-                f = cfg.kld_base_dir / f"{code}.base.json"
+                f = cfg.kld_meta_dir / f"{code}.base.json"
                 if f.exists():
                     d = read_json(f)
                     rows.append(_row(cfg, v, code, "ppl_base_run", d["ppl"], d.get("ppl_unc"), d.get("n_chunks")))

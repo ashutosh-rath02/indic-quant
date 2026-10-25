@@ -1,4 +1,11 @@
-"""Command line entry point: python -m iqp <step> [--config config.yaml] [--dry-run] [--force]."""
+"""Command line entry point: python -m iqp <step> [--config config.yaml] [--dry-run] [--force].
+
+Two ways to run the variant loop:
+  classic: quantize every variant, then KLD, MILU and MT over all of them (needs about 80 GB).
+  stream:  per variant quantize, KLD, MILU, MT, then delete the GGUF (peak about 25 GB for
+           Gemma 3 4B). Resumable, with a --max-hours budget. Used by the Kaggle configs.
+`all` follows the config's `pipeline:` setting.
+"""
 
 from __future__ import annotations
 
@@ -12,8 +19,9 @@ from iqp.util import LOG, StepError, setup_logging
 
 
 def _steps():
-    from iqp import aggregate, evals, fertility, kld, plots, prepare, quantize, report, setup_steps
+    from iqp import aggregate, evals, fertility, kld, plots, prepare, quantize, report, session, setup_steps, stream
     return {
+        "restore": session.step_restore,
         "setup": setup_steps.step_setup,
         "download": setup_steps.step_download,
         "convert": setup_steps.step_convert,
@@ -28,31 +36,58 @@ def _steps():
         "aggregate": aggregate.step_aggregate,
         "plot": plots.step_plot,
         "report": report.step_report,
+        "stream": stream.step_stream,
+        "bundle": session.step_bundle,
     }
 
 
 PIPELINE = ["setup", "download", "convert", "validate_data", "prepare_data", "build_imatrix", "quantize",
             "fertility", "run_kld", "run_milu", "run_mt", "aggregate", "plot", "report"]
 ANALYSIS = ["aggregate", "plot", "report"]
+STREAM_PIPELINE = ["restore", "setup", "download", "convert", "validate_data", "prepare_data", "build_imatrix",
+                   "stream", "aggregate", "plot", "report", "bundle"]
+
+
+def pipeline_for(cfg) -> list[str]:
+    return STREAM_PIPELINE if cfg.raw.get("pipeline", "classic") == "stream" else PIPELINE
 
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="python -m iqp", description=__doc__)
-    p.add_argument("step", help="one of: " + ", ".join(PIPELINE + ["all", "analysis", "plan", "status"]))
+    p.add_argument("step", help="one of: " + ", ".join(
+        PIPELINE + ["stream", "restore", "bundle", "all", "analysis", "plan", "status"]))
     p.add_argument("--config", default="config.yaml")
     p.add_argument("--dry-run", action="store_true", help="fake tools and data; writes to *_dryrun dirs")
     p.add_argument("--force", action="store_true", help="recompute outputs even if they exist")
     p.add_argument("--from", dest="from_step", default=None, help="with 'all': start at this step")
+    p.add_argument("--variants", default=None,
+                   help="comma separated variant names or patterns (Q4_K_M__*, *__indic, base) to restrict "
+                        "quantize, run_kld, run_milu, run_mt and stream; applied within the config's 'variants'")
+    p.add_argument("--max-hours", type=float, default=None,
+                   help="stream: stop cleanly before a variant that would likely end past this many hours "
+                        "after the step started")
+    p.add_argument("--restore-from", default=None,
+                   help="restore: directory (or tar.gz, or 'hf[:owner/repo]') holding a previous session's output; "
+                        "overrides paths.restore_from")
     a = p.parse_args(argv)
 
     cfg = Config.load(a.config, dry_run=a.dry_run)
+    cfg.runtime.update({"variants": a.variants, "max_hours": a.max_hours, "restore_from": a.restore_from})
+    try:
+        cfg.run_variants()
+    except ValueError as e:
+        p.error(str(e))
     steps = _steps()
     if a.step == "plan":
         return _plan(cfg)
     if a.step == "status":
         return _status(cfg)
     if a.step == "all":
-        names = PIPELINE[PIPELINE.index(a.from_step):] if a.from_step else PIPELINE
+        pipe = pipeline_for(cfg)
+        if a.from_step and a.from_step not in pipe:
+            p.error(f"--from {a.from_step!r} is not a step of the {cfg.raw.get('pipeline', 'classic')} pipeline: "
+                    + ", ".join(pipe))
+        names = pipe[pipe.index(a.from_step):] if a.from_step else pipe
     elif a.step == "analysis":
         names = ANALYSIS
     elif a.step in steps:
@@ -77,15 +112,23 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _plan(cfg) -> int:
-    vs = cfg.all_variants()
+    from iqp import evals
+    vs = cfg.run_variants()
     print(f"model: {cfg.raw['model']['hf_id']}  base: {cfg.base_variant().qtype}")
     print(f"languages: {', '.join(cfg.langs)}")
     print(f"calibration arms: {', '.join(cfg.calib_arms)} (token budget {cfg.raw['calibration']['token_budget']})")
     print(f"{len(vs)} variants:")
     for v in vs:
         print("  ", v.name)
-    n_kld = len(cfg.quant_variants()) * len(cfg.langs)
-    print(f"KLD runs: {n_kld}; MILU/MT server sessions: {len(vs)} each")
+    n_kld = len([v for v in vs if not v.is_base]) * len(cfg.langs)
+    milu = evals.milu_variants(cfg)
+    mt = evals.mt_variants(cfg)
+    print(f"KLD runs: {n_kld}; MILU server sessions: {len(milu)}; MT server sessions: {len(mt)}")
+    if milu and len(milu) < len(vs):
+        print("MILU variants: " + ", ".join(v.name for v in milu))
+    if mt and len(mt) < len(vs):
+        print("MT variants:   " + ", ".join(v.name for v in mt))
+    print(f"pipeline: {cfg.raw.get('pipeline', 'classic')}: " + " ".join(pipeline_for(cfg)))
     return 0
 
 
@@ -99,8 +142,8 @@ def _status(cfg) -> int:
     for arm in cfg.calib_arms:
         print(f"{mark(cfg.imatrix_path(arm).exists())}  imatrix {arm}")
     raw = cfg.raw_results_dir
-    for v in cfg.all_variants():
-        g = cfg.gguf_path(v).exists()
+    for v in cfg.run_variants():
+        g = cfg.gguf_path(v).exists() or cfg.quant_meta_path(v).exists()
         k = sum((raw / "kld" / v.name / f"{c}.json").exists() for c in cfg.langs)
         m = sum((raw / "milu" / v.name / f"{c}.json").exists() for c in cfg.langs)
         t = sum((raw / "mt" / v.name / f"{c}.json").exists() for c in cfg.langs if c != "eng_Latn")

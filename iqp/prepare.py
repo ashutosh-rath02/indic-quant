@@ -57,7 +57,8 @@ class TokenCounter:
         base = self.cfg.gguf_path(self.cfg.base_variant())
         if not base.exists():
             raise StepError(f"base GGUF missing ({base}); run convert before prepare_data")
-        f = self.cfg.data_dir / "tmp" / f"tok_{tag}.txt"
+        # Scratch copy for llama-tokenize; kept out of the persisted data directory.
+        f = self.cfg.work_dir / "tmp" / self.cfg.model_name / f"tok_{tag}.txt"
         atomic_write_text(f, text)
         out = run_cmd([str(self.cfg.bin("llama-tokenize")), "-m", str(base), "-f", str(f), "--show-count",
                        "--ids", "--no-bos", "--log-disable"],

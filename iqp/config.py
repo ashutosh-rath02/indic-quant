@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import copy
+import fnmatch
+import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -43,6 +46,25 @@ class Variant:
         return cls(q, a)
 
 
+_ENV = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
+
+
+def expand_env(value):
+    """Expand ${VAR} and ${VAR:-default} in a string (used for the paths section and
+    llamacpp.dir / convert_venv), so a notebook can redirect scratch space without editing YAML."""
+    if not isinstance(value, str):
+        return value
+
+    def rep(m):
+        v = os.environ.get(m.group(1))
+        if v:
+            return v
+        if m.group(2) is not None:
+            return m.group(2)
+        raise ValueError(f"environment variable {m.group(1)} is not set and has no default in {value!r}")
+    return _ENV.sub(rep, value)
+
+
 def _deep_update(dst: dict, src: dict) -> dict:
     for k, v in src.items():
         if isinstance(v, dict) and isinstance(dst.get(k), dict):
@@ -57,6 +79,8 @@ class Config:
         self.raw = raw
         self.path = path
         self.dry_run = dry_run
+        # Command line options that are not part of the config file (--variants, --max-hours, ...).
+        self.runtime: dict = {}
         self._validate()
 
     # ---- loading -------------------------------------------------------
@@ -66,10 +90,24 @@ class Config:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
         if overrides:
             raw = _deep_update(copy.deepcopy(raw), overrides)
+        for k, v in list(raw.get("paths", {}).items()):
+            raw["paths"][k] = expand_env(v)
+        for k in ("dir", "convert_venv"):
+            if k in raw.get("llamacpp", {}):
+                raw["llamacpp"][k] = expand_env(raw["llamacpp"][k])
+        if "cmake_extra_args" in raw.get("llamacpp", {}):
+            raw["llamacpp"]["cmake_extra_args"] = [expand_env(a) for a in raw["llamacpp"]["cmake_extra_args"]]
         if dry_run:
             # Dry runs never touch real outputs and use tiny budgets so they finish in seconds.
-            for key in ("work_dir", "results_dir", "logs_dir"):
-                raw["paths"][key] = str(Path(raw["paths"][key] + "_dryrun"))
+            out_root = str(raw["paths"].get("output_root") or "").rstrip("/")
+            for key in ("work_dir", "results_dir", "logs_dir", "state_dir", "output_root"):
+                v = str(raw["paths"].get(key) or "").rstrip("/")
+                if not v:
+                    continue
+                if out_root and key != "output_root" and (v + "/").startswith(out_root + "/"):
+                    raw["paths"][key] = out_root + "_dryrun" + v[len(out_root):]
+                else:
+                    raw["paths"][key] = v + "_dryrun"
             raw = _deep_update(raw, DRY_RUN_OVERRIDES)
         return cls(raw, path, dry_run)
 
@@ -93,6 +131,12 @@ class Config:
                 raise ValueError(f"calibrated type {q} is not in quant.ladder")
         if r["calibration"]["token_budget"] % r["calibration"]["ctx"] != 0:
             raise ValueError("calibration.token_budget must be a multiple of calibration.ctx")
+        if r.get("pipeline", "classic") not in ("classic", "stream"):
+            raise ValueError("pipeline must be 'classic' or 'stream'")
+        for key in ("variants",):
+            spec = r.get(key, "all")
+            if spec not in (None, "all") and not isinstance(spec, list):
+                raise ValueError(f"top-level '{key}' must be 'all' or a list of variant names or patterns")
 
     # ---- paths -----------------------------------------------------------
     def _p(self, rel: str) -> Path:
@@ -110,6 +154,19 @@ class Config:
     @property
     def logs_dir(self) -> Path:
         return self._p(self.raw["paths"]["logs_dir"])
+
+    @property
+    def state_dir(self) -> Path | None:
+        """Small artifacts that must survive between sessions (Kaggle: under /kaggle/working).
+
+        When unset, they live in work_dir as in the original layout.
+        """
+        v = self.raw["paths"].get("state_dir")
+        return self._p(v) if v else None
+
+    @property
+    def restore_from(self) -> str:
+        return str(self.runtime.get("restore_from") or self.raw["paths"].get("restore_from") or "")
 
     @property
     def llamacpp_dir(self) -> Path:
@@ -139,17 +196,39 @@ class Config:
         return self.work_dir / "gguf" / self.model_name
 
     @property
+    def _small_root(self) -> Path:
+        return self.state_dir or self.work_dir
+
+    @property
     def data_dir(self) -> Path:
         # Per model: calibration budgets and MILU prompt truncation use the model's tokenizer.
-        return self.work_dir / "data" / self.model_name
+        return self._small_root / "data" / self.model_name
 
     @property
     def imatrix_dir(self) -> Path:
-        return self.work_dir / "imatrix" / self.model_name
+        return self._small_root / "imatrix" / self.model_name
 
     @property
     def kld_base_dir(self) -> Path:
+        """Base logits (large, scratch)."""
         return self.work_dir / "kld_base" / self.model_name
+
+    @property
+    def kld_meta_dir(self) -> Path:
+        """KLD plan and base-run summaries (small, persisted with the state)."""
+        if self.state_dir:
+            return self.state_dir / "kld" / self.model_name
+        return self.kld_base_dir
+
+    @property
+    def meta_dir(self) -> Path:
+        """BASE_DTYPE marker and per-variant *.quant.json size records (small, persisted)."""
+        if self.state_dir:
+            return self.state_dir / "meta" / self.model_name
+        return self.gguf_dir
+
+    def quant_meta_path(self, v: "Variant") -> Path:
+        return self.meta_dir / f"{v.name}.quant.json"
 
     @property
     def raw_results_dir(self) -> Path:
@@ -215,7 +294,7 @@ class Config:
 
     def base_variant(self) -> Variant:
         # Resolve once and persist so later steps agree even if hf weights are deleted.
-        marker = self.gguf_dir / "BASE_DTYPE"
+        marker = self.meta_dir / "BASE_DTYPE"
         if marker.exists():
             return Variant(marker.read_text().strip(), BASE_ARM)
         return Variant(self.base_dtype(), BASE_ARM)
@@ -239,18 +318,54 @@ class Config:
     def all_variants(self) -> list[Variant]:
         return [self.base_variant()] + self.quant_variants()
 
-    def select_variants(self, spec) -> list[Variant]:
-        """Resolve a variants spec ("all" or list of names) to Variant objects."""
-        allv = self.all_variants()
-        if spec in (None, "all"):
-            return allv
-        names = {v.name: v for v in allv}
-        out = []
+    def _match(self, spec, pool: list[Variant]) -> list[Variant]:
+        """Variants of pool matched by spec ("all", a list, or a comma separated string).
+
+        Entries are exact names (Q4_K_M__indic), "base" for the base model, or shell patterns
+        (Q4_K_M__*, *__indic). Unknown exact names raise; patterns may match nothing.
+        Order follows pool.
+        """
+        if spec in (None, "all", ""):
+            return list(pool)
+        if isinstance(spec, str):
+            spec = [s.strip() for s in spec.split(",") if s.strip()]
+        allnames = {v.name for v in self.all_variants()}
+        keep: set[str] = set()
         for s in spec:
-            if s in ("base", "BASE"):
-                out.append(self.base_variant())
-            elif s in names:
-                out.append(names[s])
+            if s.lower() == "base":
+                keep.add(self.base_variant().name)
+            elif any(ch in s for ch in "*?["):
+                keep |= {v.name for v in pool if fnmatch.fnmatchcase(v.name, s)}
+            elif s in allnames:
+                keep.add(s)
             else:
-                raise ValueError(f"unknown variant {s!r}; known: {sorted(names)}")
+                raise ValueError(f"unknown variant {s!r}; known: {sorted(allnames)}")
+        return [v for v in pool if v.name in keep]
+
+    def select_variants(self, spec) -> list[Variant]:
+        """Resolve a per-task variants spec (milu.variants, mt.variants), within run_variants()."""
+        return self._match(spec, self.run_variants())
+
+    def run_variants(self) -> list[Variant]:
+        """All variants this run touches: top-level 'variants' then the --variants filter."""
+        out = self._match(self.raw.get("variants", "all"), self.all_variants())
+        cli = self.runtime.get("variants")
+        if cli:
+            out = self._match(cli, out)
         return out
+
+    def run_quant_variants(self) -> list[Variant]:
+        return [v for v in self.run_variants() if not v.is_base]
+
+    def configured_quant_variants(self) -> list[Variant]:
+        """Quantized variants allowed by the config file (ignores the --variants filter)."""
+        return [v for v in self._match(self.raw.get("variants", "all"), self.all_variants()) if not v.is_base]
+
+    def vocab_size(self) -> int | None:
+        """Vocabulary size from the HF config, used for disk estimates."""
+        import json
+        f = self.hf_dir / "config.json"
+        if not f.exists():
+            return None
+        c = json.loads(f.read_text())
+        return c.get("vocab_size") or (c.get("text_config") or {}).get("vocab_size")

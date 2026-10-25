@@ -48,42 +48,64 @@ def step_build_imatrix(cfg, force: bool = False) -> None:
         LOG.info("imatrix %s: %d chunks x %d ctx", arm, chunks, c["ctx"])
 
 
-def step_quantize(cfg, force: bool = False) -> None:
-    base_v = cfg.base_variant()
-    base = cfg.gguf_path(base_v)
+def quant_threads(cfg) -> int:
+    return int(cfg.raw["quant"].get("threads") or 0) or (os.cpu_count() or 4)
+
+
+def quantize_variant(cfg, v, force: bool = False) -> dict:
+    """Quantize one variant from the base GGUF. Writes the GGUF and its size record."""
+    base = cfg.gguf_path(cfg.base_variant())
     if not base.exists():
         raise StepError(f"base GGUF missing: {base}")
-    threads = int(cfg.raw["quant"].get("threads") or 0) or (os.cpu_count() or 4)
-    for v in cfg.quant_variants():
-        out = cfg.gguf_path(v)
-        meta = cfg.gguf_dir / f"{v.name}.quant.json"
-        if out.exists() and meta.exists() and not force:
-            LOG.info("skip (exists): %s", out.name)
-            continue
-        cmd = [str(cfg.bin("llama-quantize"))]
-        if v.arm != STATIC_ARM:
-            im = cfg.imatrix_path(v.arm)
-            if not im.exists():
-                raise StepError(f"imatrix missing for arm {v.arm}: {im}; run build_imatrix")
-            cmd += ["--imatrix", str(im)]
-        tmp = out.with_name(out.name + ".part")
-        cmd += [str(base), str(tmp), v.qtype, str(threads)]
+    out = cfg.gguf_path(v)
+    meta = cfg.quant_meta_path(v)
+    if out.exists() and meta.exists() and not force:
+        LOG.info("skip (exists): %s", out.name)
+        return read_json(meta)
+    cmd = [str(cfg.bin("llama-quantize"))]
+    if v.arm != STATIC_ARM:
+        im = cfg.imatrix_path(v.arm)
+        if not im.exists():
+            raise StepError(f"imatrix missing for arm {v.arm}: {im}; run build_imatrix")
+        cmd += ["--imatrix", str(im)]
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_name(out.name + ".part")
+    cmd += [str(base), str(tmp), v.qtype, str(quant_threads(cfg))]
+    try:
         log = run_cmd(cmd, cfg.logs_dir / "quantize" / f"{v.name}.log")
-        info = parse_quantize_output(log)
-        os.replace(tmp, out)
-        info.update({"variant": v.name, "qtype": v.qtype, "arm": v.arm, "file_bytes": out.stat().st_size})
-        atomic_write_json(meta, info)
-        LOG.info("quantized %s: %.1f MiB, %.3f bpw", v.name, info["quant_mib"], info["quant_bpw"])
-    bm = cfg.gguf_dir / f"{base_v.name}.quant.json"
-    if not bm.exists():
+    except StepError:
+        tmp.unlink(missing_ok=True)
+        raise
+    info = parse_quantize_output(log)
+    os.replace(tmp, out)
+    info.update({"variant": v.name, "qtype": v.qtype, "arm": v.arm, "file_bytes": out.stat().st_size})
+    atomic_write_json(meta, info)
+    LOG.info("quantized %s: %.1f MiB, %.3f bpw", v.name, info["quant_mib"], info["quant_bpw"])
+    return info
+
+
+def write_base_meta(cfg) -> None:
+    base_v = cfg.base_variant()
+    base = cfg.gguf_path(base_v)
+    bm = cfg.quant_meta_path(base_v)
+    if not bm.exists() and base.exists():
         atomic_write_json(bm, {"variant": base_v.name, "qtype": base_v.qtype, "arm": base_v.arm,
                                "file_bytes": base.stat().st_size, "quant_bpw": 16.0})
+
+
+def step_quantize(cfg, force: bool = False) -> None:
+    base = cfg.gguf_path(cfg.base_variant())
+    if not base.exists():
+        raise StepError(f"base GGUF missing: {base}")
+    for v in cfg.run_quant_variants():
+        quantize_variant(cfg, v, force)
+    write_base_meta(cfg)
 
 
 def load_sizes(cfg) -> list[dict]:
     rows = []
     for v in cfg.all_variants():
-        meta = cfg.gguf_dir / f"{v.name}.quant.json"
+        meta = cfg.quant_meta_path(v)
         if meta.exists():
             m = read_json(meta)
             rows.append({"variant": v.name, "qtype": v.qtype, "arm": v.arm,
