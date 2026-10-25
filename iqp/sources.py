@@ -1,19 +1,21 @@
 """Loaders for Hugging Face datasets, with explicit schema validation.
 
-Dataset layouts were checked on the Hub on 2026-10-25 (file listings and dataset cards):
+Dataset layouts (checked on the Hub on 2026-10-25; the gated files marked "confirmed" were
+opened with an authorized token and their columns read):
 
-* openlanguagedata/flores_plus (gated): files {dev,devtest}/{iso639_3}_{script}.jsonl,
-  fields id, text, iso_639_3, iso_15924, glottocode, variant, url, domain, topic.
-* ai4bharat/IN22-Gen (gated): one parquet, data/train-00000-of-00001.parquet (split "test"),
-  columns sentence_{code} per language, plus id, domain, source.
-* ai4bharat/MILU (gated): {Language}/{test,validation}-00000-of-00001.parquet, columns
-  question, option1..option4, target ("option1".."option4"), as used by the official
-  lm-eval task in github.com/AI4Bharat/MILU. A subject column is assumed but optional.
+* openlanguagedata/flores_plus (gated, confirmed): files {dev,devtest}/{iso639_3}_{script}.jsonl,
+  one JSON object per line with id (int, from 0, restarting in each split), text, iso_639_3,
+  iso_15924, glottocode, variant, url, domain, topic, split. Only id and text are used.
+* ai4bharat/MILU (gated, confirmed): {Language}/{test,validation}-00000-of-00001.parquet, columns
+  question, option1..option4, target ("option1".."option4"), is_translated, language, domain,
+  subject. Hindi test has about 14.8k rows.
+* ai4bharat/IN22-Gen (gated, fallback only): data/train-00000-of-00001.parquet exists (the card
+  maps it to split "test"). The per-language column names (sentence_{code}) are not confirmed.
 * wikimedia/wikipedia: {snapshot}.{wiki}/train-*.parquet, columns id, url, title, text.
 * ai4bharat/sangraha: verified/{lang3}/data-*.parquet, columns doc_id, text.
 
-Gated files could not be opened from the build sandbox, so every loader validates the
-columns it needs and raises SchemaError with the observed schema when they differ.
+Every loader still validates the columns it needs and raises SchemaError with the observed
+schema when they differ.
 """
 
 from __future__ import annotations
