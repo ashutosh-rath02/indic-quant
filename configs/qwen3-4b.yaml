@@ -1,0 +1,138 @@
+# indic-quant-pilot configuration.
+# Every step reads this file. Paths are relative to the repo root unless absolute.
+
+run_name: qwen3-4b-pilot
+
+paths:
+  work_dir: work          # models, GGUF files, imatrices, base logits, prepared data
+  results_dir: results/qwen3-4b    # tidy CSVs, plots, REPORT.md
+  logs_dir: logs/qwen3-4b          # one log file per step and per sub-task
+
+model:
+  hf_id: Qwen/Qwen3-4B
+  revision: main
+  short_name: qwen3-4b
+  # Base precision for the reference GGUF. "auto" picks bf16 when the HF config says
+  # torch_dtype bfloat16 (true for Gemma 3 and Qwen3), otherwise f16.
+  base_dtype: auto
+  hf_token_env: HF_TOKEN        # gated models and datasets read the token from this env var
+  delete_hf_weights_after_convert: false
+
+llamacpp:
+  repo: https://github.com/ggml-org/llama.cpp.git
+  # Commit verified while building this repo (tag b11870, 2026-10-25).
+  commit: 74bca3950054eed1795f525cb9cf06bfe796492d
+  dir: work/llama.cpp
+  cuda: true
+  cmake_extra_args: []          # e.g. ["-DCMAKE_CUDA_ARCHITECTURES=89"]
+  build_jobs: 0                 # 0 = use all cores
+  n_gpu_layers: 999
+  threads: 0                    # 0 = llama.cpp default
+  convert_venv: work/venv-convert
+
+languages:
+  # code: FLORES+ / IN22 code. milu: MILU config name. wiki: wikimedia/wikipedia subset suffix.
+  # sangraha: ai4bharat/sangraha "verified" split name. role: control or indic.
+  enabled: [eng_Latn, hin_Deva, ben_Beng, tam_Taml, tel_Telu, mar_Deva]
+  registry:
+    eng_Latn: {name: English,   milu: English,   wiki: en, sangraha: eng, role: control}
+    hin_Deva: {name: Hindi,     milu: Hindi,     wiki: hi, sangraha: hin, role: indic}
+    ben_Beng: {name: Bengali,   milu: Bengali,   wiki: bn, sangraha: ben, role: indic}
+    tam_Taml: {name: Tamil,     milu: Tamil,     wiki: ta, sangraha: tam, role: indic}
+    tel_Telu: {name: Telugu,    milu: Telugu,    wiki: te, sangraha: tel, role: indic}
+    mar_Deva: {name: Marathi,   milu: Marathi,   wiki: mr, sangraha: mar, role: indic}
+    kan_Knda: {name: Kannada,   milu: Kannada,   wiki: kn, sangraha: kan, role: indic}
+    mal_Mlym: {name: Malayalam, milu: Malayalam, wiki: ml, sangraha: mal, role: indic}
+    guj_Gujr: {name: Gujarati,  milu: Gujarati,  wiki: gu, sangraha: guj, role: indic}
+    ory_Orya: {name: Odia,      milu: Odia,      wiki: or, sangraha: ori, role: indic}
+    pan_Guru: {name: Punjabi,   milu: Punjabi,   wiki: pa, sangraha: pan, role: indic}
+
+quant:
+  ladder: [Q8_0, Q6_K, Q5_K_M, Q4_K_M, Q3_K_M, Q2_K, IQ2_M]
+  # Types that llama-quantize refuses to produce without an imatrix.
+  requires_imatrix: [IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ2_M, IQ3_XXS, Q2_K_S]
+  calibrated_types: [Q4_K_M, Q3_K_M, Q2_K, IQ2_M]
+  threads: 0                    # llama-quantize thread count; 0 = all cores
+
+calibration:
+  source: wikipedia             # wikipedia | sangraha
+  wikipedia_repo: wikimedia/wikipedia
+  wikipedia_snapshot: "20231101"
+  sangraha_repo: ai4bharat/sangraha
+  sangraha_config: verified
+  token_budget: 131072          # identical token budget for every calibration arm (model tokenizer)
+  ctx: 512                      # llama-imatrix context; chunks = token_budget / ctx
+  max_paragraph_chars: 4000
+  min_paragraph_chars: 80
+  candidate_chars_per_lang: 1500000   # raw text pulled per language before trimming to budget
+  seed: 1234
+  ngram_filter: 8               # drop calibration paragraphs sharing any word 8-gram with eval text; 0 disables
+  arms:
+    en:            {langs: [eng_Latn]}
+    indic:         {langs: [hin_Deva, ben_Beng, tam_Taml, tel_Telu, mar_Deva], english_fraction: 0.0}
+    indic_no_tam:  {langs: [hin_Deva, ben_Beng, tel_Telu, mar_Deva], english_fraction: 0.0}
+
+eval:
+  source: flores_plus           # flores_plus | in22_gen | local
+  flores_repo: openlanguagedata/flores_plus
+  flores_file_template: "{split}/{code}.jsonl"
+  flores_text_field: text
+  flores_id_field: id
+  flores_kld_split: devtest     # KLD and fertility text
+  flores_mt_split: dev          # translation sentences (disjoint from the KLD text)
+  in22_repo: ai4bharat/IN22-Gen
+  in22_file: data/train-00000-of-00001.parquet
+  in22_column_template: "sentence_{code}"
+  local_dir: ""                 # for source=local: <dir>/{kld,mt}/{code}.txt, one sentence per line, line-aligned
+  seed: 1234
+
+kld:
+  ctx: 512
+  batch: 512
+  # Base logits are stored as uint16 per vocab entry for ctx/2 positions per chunk:
+  # bytes ~= chunks * (ctx/2) * vocab * 2. Gemma 3 (vocab 262144): ~134 MB per chunk at ctx 512,
+  # so 24 chunks x 6 languages ~= 19 GB. Qwen3 (vocab 151936): ~78 MB per chunk.
+  max_chunks: 40                # per language (40 chunks x 255 scored positions = 10200 tokens)
+  equalize_chunks: true         # same number of scored tokens for every language
+  delete_base_logits_when_done: false   # free disk once every variant has been scored for a language
+
+milu:
+  enabled: true
+  repo: ai4bharat/MILU
+  file_template: "{lang}/{split}-00000-of-00001.parquet"
+  local_dir: ""                 # optional: <dir>/{lang}/{test,validation}.parquet with the same columns
+  question_field: question
+  option_fields: [option1, option2, option3, option4]
+  target_field: target          # values like "option2"
+  subject_field: subject        # used to pick same-subject few-shot examples when present
+  k_shot: 5
+  sample_cap: 500
+  seed: 1234
+  n_probs: 100
+  variants: all                 # "all" or a list of variant names
+
+mt:
+  enabled: true
+  n_sentences: 200
+  max_tokens: 256
+  variants: all
+  prompt: "Translate the following sentence from English into {target}. Reply with the translation only, without any explanation.\n\n{source}"
+
+server:
+  host: 127.0.0.1
+  port: 18080
+  parallel: 4
+  ctx_per_slot: 8192
+  startup_timeout_s: 600
+  request_timeout_s: 600
+  client_threads: 4
+  cache_prompt: true            # reuses shared few-shot prefixes; see README for the determinism note
+  seed: 1234
+  extra_args: []
+
+decision:
+  # Strong signal requires both conditions below.
+  min_relative_kld_reduction: 0.10   # Indic-calibrated vs English-calibrated, mean over Indic languages
+  min_quants_with_reduction: 2       # out of calibration.calibrated types
+  min_language_gap_ratio: 2.0        # worst Indic mean KLD / English mean KLD at the same variant
+  gap_reference_variant: Q4_K_M__static

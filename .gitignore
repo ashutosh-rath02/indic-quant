@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+work/
+work_dryrun/
+results_dryrun/
+logs/
+logs_dryrun/
+results/raw/

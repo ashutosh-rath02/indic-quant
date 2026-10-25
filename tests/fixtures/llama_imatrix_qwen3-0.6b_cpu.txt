@@ -1,0 +1,19 @@
+$ /tmp/claude-0/-home-claude/b102f6a4-c2c4-5ae4-b4b7-dfff44c92df8/scratchpad/src/llama.cpp/build/bin/llama-imatrix -m /tmp/claude-0/-home-claude/b102f6a4-c2c4-5ae4-b4b7-dfff44c92df8/scratchpad/smoke/work/gguf/qwen3-0.6b/qwen3-0.6b-BF16__base.gguf -f /tmp/claude-0/-home-claude/b102f6a4-c2c4-5ae4-b4b7-dfff44c92df8/scratchpad/smoke/work/data/calib/indic.txt -o /tmp/claude-0/-home-claude/b102f6a4-c2c4-5ae4-b4b7-dfff44c92df8/scratchpad/smoke/work/imatrix/qwen3-0.6b/indic.imatrix.part.gguf -c 256 -b 256 --chunks 8 --output-frequency 1000 -ngl 0
+
+warning: no usable GPU found, --gpu-layers option will be ignored
+warning: one possible reason is that llama.cpp was compiled without GPU support
+warning: consult docs/build.md for compilation instructions
+0.00.336.079 W load: control-looking token: 128247 '</s>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.00.406.408 I cmn          init: llama threadpool init, n_threads = 2
+0.00.406.479 I 
+0.00.406.584 I system_info: n_threads = 2 (n_threads_batch = 2) / 2 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX_VNNI = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | AVX512 = 1 | AVX512_VBMI = 1 | AVX512_VNNI = 1 | AVX512_BF16 = 1 | AMX_INT8 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+0.00.406.589 I compute_imatrix: tokenizing the input ..
+0.00.408.420 I compute_imatrix: tokenization took 1.828 ms
+0.00.408.450 I compute_imatrix: computing over 8 chunks, n_ctx=256, batch_size=256, n_seq=1
+0.02.817.699 I compute_imatrix: 2.41 seconds per pass - ETA 0.32 minutes
+[1]1.7636,[2]1.9804,[3]2.3046,[4]2.3009,[5]2.2693,[6]2.2214,[7]2.0665,[8]2.1152,
+Final estimate: PPL = 2.1152 +/- 0.10369
+
+
+
+[exit code 0, 19.7s]

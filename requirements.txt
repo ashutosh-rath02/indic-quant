@@ -1,0 +1,16 @@
+# Analysis environment for indic-quant-pilot (Python 3.10 to 3.13).
+# Tested by running the full test suite on CPython 3.10.20 and 3.13.17 with exactly these pins.
+# The HF to GGUF converter runs in a separate venv built from llama.cpp's own
+# requirements/requirements-convert_hf_to_gguf.txt (created by the setup step), because it
+# pins transformers 4.57.6 and protobuf < 5.
+datasets==5.1.0
+huggingface_hub==2.3.0
+tokenizers==0.23.3
+sacrebleu==2.6.0
+pandas==2.3.3
+numpy==2.2.6
+pyarrow==25.0.1
+matplotlib==3.10.9
+PyYAML==6.0.3
+requests==2.34.2
+pytest==9.1.1
