@@ -190,6 +190,25 @@ def cuda_cmake_args(nvcc: Path) -> list[str]:
     return args
 
 
+def create_venv(venv: Path, logs: Path) -> None:
+    """Create a virtualenv with pip. Some images (Kaggle among them) ship a Python whose stdlib
+    venv cannot bootstrap pip (ensurepip is missing or broken), so fall back to the virtualenv
+    package, which bundles its own pip wheel."""
+    try:
+        run_cmd([sys.executable, "-m", "venv", str(venv)], logs / "venv_create.log")
+        if (venv / "bin" / "python").exists():
+            return
+    except StepError as e:
+        LOG.warning("stdlib venv failed (%s); falling back to virtualenv", str(e).splitlines()[0])
+    shutil.rmtree(venv, ignore_errors=True)
+    probe = subprocess.run([sys.executable, "-c", "import virtualenv"], capture_output=True)
+    if probe.returncode != 0:
+        run_cmd([sys.executable, "-m", "pip", "install", "-q", "virtualenv"], logs / "virtualenv_install.log")
+    run_cmd([sys.executable, "-m", "virtualenv", str(venv)], logs / "venv_create_virtualenv.log")
+    if not (venv / "bin" / "python").exists():
+        raise StepError(f"could not create the converter virtualenv at {venv}")
+
+
 def step_setup(cfg, force: bool = False) -> None:
     if cfg.dry_run:
         from iqp.fakes.shims import install_fake_llamacpp
@@ -264,7 +283,7 @@ def step_setup(cfg, force: bool = False) -> None:
     py = venv / "bin" / "python"
     marker = venv / "IQP_REQS_COMMIT"
     if not py.exists():
-        run_cmd([sys.executable, "-m", "venv", str(venv)], logs / "venv_create.log")
+        create_venv(venv, logs)
     if force or not marker.exists() or marker.read_text().strip() != lc["commit"]:
         run_cmd([str(py), "-m", "pip", "install", "--upgrade", "pip"], logs / "venv_pip.log")
         run_cmd([str(py), "-m", "pip", "install", "-r",
