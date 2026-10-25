@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -144,6 +145,51 @@ def find_nvcc() -> Path | None:
     return None
 
 
+def find_cuda_driver_lib(cuda_root: Path) -> Path | None:
+    """Locate libcuda for linking. CMake's FindCUDAToolkit creates the CUDA::cuda_driver target
+    only when it finds libcuda; some images (Kaggle GPU images among them) ship the toolkit
+    without a discoverable stub, so ggml-cuda then fails at configure time. Prefer the toolkit
+    stub, then the driver library mounted into the container."""
+    cands = [
+        cuda_root / "lib64" / "stubs" / "libcuda.so",
+        cuda_root / "targets" / "x86_64-linux" / "lib" / "stubs" / "libcuda.so",
+        cuda_root / "lib" / "stubs" / "libcuda.so",
+    ]
+    for d in ("/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/usr/local/nvidia/lib64",
+              "/usr/lib64-nvidia", "/usr/local/nvidia/lib", "/usr/lib/wsl/lib"):
+        cands += [Path(d) / "libcuda.so", Path(d) / "libcuda.so.1"]
+    for c in cands:
+        if c.exists():
+            return c
+    try:
+        out = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True, timeout=30).stdout
+        for line in out.splitlines():
+            if "libcuda.so" in line and "=>" in line:
+                p = Path(line.split("=>")[-1].strip())
+                if p.exists():
+                    return p
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def cuda_cmake_args(nvcc: Path) -> list[str]:
+    """Explicit toolkit and driver hints so configure does not depend on CMake's search heuristics."""
+    root = nvcc.resolve().parent.parent
+    args = [f"-DCUDAToolkit_ROOT={root}", f"-DCMAKE_CUDA_COMPILER={nvcc}"]
+    drv = find_cuda_driver_lib(root)
+    if drv is not None:
+        LOG.info("libcuda for linking: %s", drv)
+        args.append(f"-DCUDA_cuda_driver_LIBRARY={drv}")
+    else:
+        # ggml links libcuda only for its virtual memory management pool; without a libcuda to
+        # link against, build without VMM rather than fail (small allocation overhead only).
+        LOG.warning("libcuda not found in the toolkit stubs or driver directories; "
+                    "building with -DGGML_CUDA_NO_VMM=ON so ggml-cuda does not need CUDA::cuda_driver")
+        args.append("-DGGML_CUDA_NO_VMM=ON")
+    return args
+
+
 def step_setup(cfg, force: bool = False) -> None:
     if cfg.dry_run:
         from iqp.fakes.shims import install_fake_llamacpp
@@ -192,7 +238,12 @@ def step_setup(cfg, force: bool = False) -> None:
         extra = list(lc["cmake_extra_args"])
         if lc["cuda"]:
             extra = adjust_cuda_archs(extra, nvcc_version(Path(env["CUDACXX"])))
+            user_keys = {a.split("=", 1)[0] for a in extra}
+            extra = [a for a in cuda_cmake_args(Path(env["CUDACXX"]))
+                     if a.split("=", 1)[0] not in user_keys] + extra
         args += extra
+        # A previous failed configure leaves a cache that would keep the bad toolkit lookup.
+        (d / "build" / "CMakeCache.txt").unlink(missing_ok=True)
         run_cmd(args, logs / "cmake_configure.log", env=env)
         jobs = int(lc.get("build_jobs") or 0) or (os.cpu_count() or 4)
         run_cmd(["cmake", "--build", str(d / "build"), "--config", "Release", "-j", str(jobs), "--target",
