@@ -1,0 +1,188 @@
+# indic-quant-pilot configuration for Kaggle notebooks (Gemma 3 4B).
+#
+# Kaggle constraints this file is built around (see README, "Running on Kaggle"):
+#   one T4 (16 GB, compute 7.5) or P100 (16 GB, compute 6.0), no fast BF16 on either;
+#   12 h per session, about 30 GPU hours per week; about 4 vCPUs and 29 GB RAM;
+#   /kaggle/working (about 20 GB) is the only directory that survives "Save Version";
+#   other local disk is scratch and is wiped between sessions.
+#
+# Large files (HF weights, F16 GGUF, base logits, one quantized variant at a time) go to scratch
+# under paths.work_dir. Everything small that a later session needs (prepared data, imatrices,
+# KLD plan, size records, timings, cached llama.cpp binaries) goes to paths.state_dir under
+# /kaggle/working, next to results and logs. The stream step processes one variant at a time
+# and deletes its GGUF afterwards, so peak scratch use is about 21 GB (see the disk math below).
+#
+# ${VAR:-default} in paths is expanded from the environment, so the notebook can point scratch
+# somewhere else without editing this file.
+
+run_name: gemma3-4b-kaggle
+pipeline: stream          # `python -m iqp all` runs restore ... build_imatrix, stream, analysis, bundle
+
+paths:
+  work_dir: ${IQP_WORK_DIR:-/tmp/iqp-work}                         # scratch, not persisted
+  output_root: ${IQP_OUTPUT_ROOT:-/kaggle/working/iqp}            # persisted by Save Version
+  state_dir: ${IQP_OUTPUT_ROOT:-/kaggle/working/iqp}/state
+  results_dir: ${IQP_OUTPUT_ROOT:-/kaggle/working/iqp}/results
+  logs_dir: ${IQP_OUTPUT_ROOT:-/kaggle/working/iqp}/logs
+  # Previous session's output, attached with "Add Input". The restore step searches this
+  # directory (up to 5 levels deep) for IQP_OUTPUT.json or iqp-output.tar.gz. Nothing found is
+  # fine in session 1 (restore_required: false).
+  restore_from: ${IQP_RESTORE_FROM:-/kaggle/input}
+  restore_required: false
+  # Optional alternative to attaching outputs: a private HF dataset repo that the bundle step
+  # pushes to and `--restore-from hf` pulls from. Needs a write token. Leave empty to disable.
+  hf_state_repo: ""
+
+model:
+  hf_id: google/gemma-3-4b-it
+  revision: main
+  short_name: gemma-3-4b-it
+  # T4 and P100 have no fast BF16 path, so the reference model is F16. Gemma 3 is trained in
+  # BF16; F16 has a smaller exponent range, but llama.cpp keeps F32 accumulation for the
+  # attention and output products, and the 4B text weights fit F16 range.
+  base_dtype: f16
+  hf_token_env: HF_TOKEN
+  delete_hf_weights_after_convert: true   # frees about 8.6 GB of scratch right after conversion
+
+llamacpp:
+  repo: https://github.com/ggml-org/llama.cpp.git
+  commit: 74bca3950054eed1795f525cb9cf06bfe796492d   # tag b11870, verified while building this repo
+  dir: ${IQP_WORK_DIR:-/tmp/iqp-work}/llama.cpp
+  cuda: true
+  # Real device code for exactly the two Kaggle GPU types: 75 = T4 (Turing), 60 = P100 (Pascal).
+  # llama.cpp's default list compiles about eight architectures (several as PTX), which roughly
+  # triples CUDA compile time on 4 vCPUs and still needs a JIT step for sm_60/sm_75. CUDA 13
+  # dropped sm_60; the setup step removes 60 with a warning if nvcc is 13 or newer.
+  # Override with IQP_CUDA_ARCHS in the notebook or by editing this list.
+  cmake_extra_args: ["-DCMAKE_CUDA_ARCHITECTURES=${IQP_CUDA_ARCHS:-60;75}"]
+  build_jobs: 0                 # 0 = all vCPUs
+  n_gpu_layers: 999
+  threads: 0
+  convert_venv: ${IQP_WORK_DIR:-/tmp/iqp-work}/venv-convert
+  # Copy the built binaries (about 100 to 300 MB with CUDA) into state_dir so session 2 can skip
+  # the 15 to 30 minute build. Reused only if the commit, flags, directory and CPU type match.
+  cache_build: true
+
+languages:
+  # code: FLORES+ / IN22 code. milu: MILU config name. wiki: wikimedia/wikipedia subset suffix.
+  # sangraha: ai4bharat/sangraha "verified" split name. role: control or indic.
+  enabled: [eng_Latn, hin_Deva, ben_Beng, tam_Taml, tel_Telu, mar_Deva]
+  registry:
+    eng_Latn: {name: English,   milu: English,   wiki: en, sangraha: eng, role: control}
+    hin_Deva: {name: Hindi,     milu: Hindi,     wiki: hi, sangraha: hin, role: indic}
+    ben_Beng: {name: Bengali,   milu: Bengali,   wiki: bn, sangraha: ben, role: indic}
+    tam_Taml: {name: Tamil,     milu: Tamil,     wiki: ta, sangraha: tam, role: indic}
+    tel_Telu: {name: Telugu,    milu: Telugu,    wiki: te, sangraha: tel, role: indic}
+    mar_Deva: {name: Marathi,   milu: Marathi,   wiki: mr, sangraha: mar, role: indic}
+    kan_Knda: {name: Kannada,   milu: Kannada,   wiki: kn, sangraha: kan, role: indic}
+    mal_Mlym: {name: Malayalam, milu: Malayalam, wiki: ml, sangraha: mal, role: indic}
+    guj_Gujr: {name: Gujarati,  milu: Gujarati,  wiki: gu, sangraha: guj, role: indic}
+    ory_Orya: {name: Odia,      milu: Odia,      wiki: or, sangraha: ori, role: indic}
+    pan_Guru: {name: Punjabi,   milu: Punjabi,   wiki: pa, sangraha: pan, role: indic}
+
+quant:
+  ladder: [Q8_0, Q6_K, Q5_K_M, Q4_K_M, Q3_K_M, Q2_K, IQ2_M]
+  # Types that llama-quantize refuses to produce without an imatrix.
+  requires_imatrix: [IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ2_M, IQ3_XXS, Q2_K_S]
+  calibrated_types: [Q4_K_M, Q3_K_M, Q2_K, IQ2_M]
+  threads: 0                    # llama-quantize thread count; 0 = all cores
+
+calibration:
+  source: wikipedia             # wikipedia | sangraha
+  wikipedia_repo: wikimedia/wikipedia
+  wikipedia_snapshot: "20231101"
+  sangraha_repo: ai4bharat/sangraha
+  sangraha_config: verified
+  token_budget: 131072          # identical token budget for every calibration arm (model tokenizer)
+  ctx: 512                      # llama-imatrix context; chunks = token_budget / ctx
+  max_paragraph_chars: 4000
+  min_paragraph_chars: 80
+  candidate_chars_per_lang: 1500000   # raw text pulled per language before trimming to budget
+  seed: 1234
+  ngram_filter: 8               # drop calibration paragraphs sharing any word 8-gram with eval text; 0 disables
+  arms:
+    en:            {langs: [eng_Latn]}
+    indic:         {langs: [hin_Deva, ben_Beng, tam_Taml, tel_Telu, mar_Deva], english_fraction: 0.0}
+    indic_no_tam:  {langs: [hin_Deva, ben_Beng, tel_Telu, mar_Deva], english_fraction: 0.0}
+
+eval:
+  source: flores_plus           # flores_plus | in22_gen | local
+  flores_repo: openlanguagedata/flores_plus
+  flores_file_template: "{split}/{code}.jsonl"
+  flores_text_field: text
+  flores_id_field: id
+  flores_kld_split: devtest     # KLD and fertility text
+  flores_mt_split: dev          # translation sentences (disjoint from the KLD text)
+  in22_repo: ai4bharat/IN22-Gen
+  in22_file: data/train-00000-of-00001.parquet
+  in22_column_template: "sentence_{code}"
+  local_dir: ""                 # for source=local: <dir>/{kld,mt}/{code}.txt, one sentence per line, line-aligned
+  seed: 1234
+
+kld:
+  ctx: 512
+  batch: 512
+  # Base logits file size (llama.cpp perplexity.cpp layout, uint16 per vocab entry for the
+  # 255 scored positions of each chunk): about chunks * 255 * vocab * 2 bytes.
+  # Gemma 3 (vocab 262144): 133.7 MB per chunk; 12 chunks = 1.49 GiB per language,
+  #   6 languages = 8.97 GiB. (24 chunks would be 17.9 GiB and does not fit next to the rest.)
+  # Peak scratch during stream: F16 GGUF 7.3 GiB + logits 9.0 GiB + Q8_0 variant 3.9 GiB
+  #   + llama.cpp build and converter venv about 2.5 GiB = about 22.7 GiB.
+  max_chunks: 12                # per language: 12 x 255 = 3060 scored tokens
+  equalize_chunks: true
+  delete_base_logits_when_done: true    # once every configured variant has been scored for a language
+
+milu:
+  enabled: true
+  repo: ai4bharat/MILU
+  file_template: "{lang}/{split}-00000-of-00001.parquet"
+  local_dir: ""                 # optional: <dir>/{lang}/{test,validation}.parquet with the same columns
+  question_field: question
+  option_fields: [option1, option2, option3, option4]
+  target_field: target          # values like "option2"
+  subject_field: subject        # used to pick same-subject few-shot examples when present
+  k_shot: 5
+  sample_cap: 200               # per language
+  seed: 1234
+  n_probs: 100
+  # MILU and MT run on a subset that answers the main questions (base, near-lossless Q8_0, the
+  # common Q4_K_M and the aggressive Q2_K, each with every calibration arm). KLD covers all 19.
+  variants: [base, Q8_0__static, "Q4_K_M__*", "Q2_K__*"]
+
+mt:
+  enabled: true
+  n_sentences: 100
+  max_tokens: 256
+  variants: [base, Q8_0__static, "Q4_K_M__*", "Q2_K__*"]
+  prompt: "Translate the following sentence from English into {target}. Reply with the translation only, without any explanation.\n\n{source}"
+
+server:
+  host: 127.0.0.1
+  port: 18080
+  parallel: 4
+  ctx_per_slot: 8192
+  startup_timeout_s: 600
+  request_timeout_s: 600
+  client_threads: 4
+  cache_prompt: true            # reuses shared few-shot prefixes; see README for the determinism note
+  seed: 1234
+  extra_args: []
+
+stream:
+  delete_variant_gguf: true     # delete each quantized GGUF once its results are written
+  safety_factor: 1.25           # --max-hours: start a variant only if elapsed + 1.25 x estimate fits
+  aggregate_each_variant: true  # refresh results_tidy.csv after each variant
+  bundle_each_variant: true     # refresh iqp-output.tar.gz after each variant (a few MB)
+  # Order of work. The calibration comparison (Q4_K_M and Q2_K across arms) is the main result,
+  # so it runs first; a session cut short then still has the most useful numbers.
+  priority: ["Q4_K_M__*", "Q2_K__*", "Q3_K_M__*", "IQ2_M__*", Q8_0__static, base]
+  # Estimates used by --max-hours before anything has been measured in this run or restored
+  # from an earlier session (T4, Gemma 3 4B; deliberately on the slow side).
+  fallback_minutes: {quantize: 6, kld_per_lang: 1.5, milu: 30, mt: 20}
+
+decision:
+  # Strong signal requires both conditions below.
+  min_relative_kld_reduction: 0.10   # Indic-calibrated vs English-calibrated, mean over Indic languages
+  min_quants_with_reduction: 2       # out of calibration.calibrated types
+  min_language_gap_ratio: 2.0        # worst Indic mean KLD / English mean KLD at the same variant
+  gap_reference_variant: Q4_K_M__static

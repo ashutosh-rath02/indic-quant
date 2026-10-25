@@ -8,3 +8,16 @@ results_dryrun/
 logs/
 logs_dryrun/
 results/raw/
+# Kaggle mode and smoke runs (scratch, persisted outputs, bundles); never commit models or logits
+iqp-work/
+iqp-work_dryrun/
+iqp_dryrun/
+results/
+*.gguf
+*.gguf.part
+*.logits
+*.safetensors
+*.tar.gz
+*.imatrix
+smoke*/
+.ipynb_checkpoints/

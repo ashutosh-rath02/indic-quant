@@ -4,7 +4,7 @@ PY     := $(VENV)/bin/python
 IQP    := $(PY) -m iqp --config $(CONFIG)
 
 STEPS := setup download convert validate_data prepare_data build_imatrix quantize fertility \
-         run_kld run_milu run_mt aggregate plot report
+         run_kld run_milu run_mt aggregate plot report stream restore bundle
 
 .PHONY: all venv test dryrun plan status analysis clean-dryrun $(STEPS)
 
